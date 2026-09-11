@@ -34,6 +34,9 @@ uv run pytest
 - `tests/` -- pytest unit tests for the package.
 - `data/` -- the real survey data and codebook used in the paper's example;
   see `data/README.md` for provenance.
+- `original/` -- the hand-written 2023 prototype (`comp_funcs.py` and a
+  notebook) that `src/surveymatch/` extends; see `paper.qmd`'s AI use
+  disclosure section for how the two relate.
 
 ## License
 

@@ -128,7 +128,7 @@ Finally, this is a screening tool. A flagged cluster in <a href="#sec-realdata" 
 
 # AI use disclosure
 
-The `surveymatch` Python package, its test suite, the simulations in this paper, and the paper text were produced with Claude Code (Anthropic, Sonnet 5) under my direction and review. I designed the original method and wrote the reference implementation this package extends and cleans up (`comp_funcs.py` and the accompanying notebook, linked from the repository), selected the real survey data and its preprocessing, specified every simulation design and parameter choice described above, and reviewed the generated code, statistical results, and text for correctness before publication. All numeric results and figures in this paper are computed live by the code shown or linked in the repository, not hand-entered.
+The `surveymatch` Python package, its test suite, the simulations in this paper, and the paper text were produced with Claude Code (Anthropic, Sonnet 5) under my direction and review. I designed the original method and wrote the reference implementation this package extends and cleans up (preserved with no AI involvement under `original/` in this repository), selected the real survey data and its preprocessing, specified every simulation design and parameter choice described above, and reviewed the generated code, statistical results, and text for correctness before publication. All numeric results and figures in this paper are computed live by the code shown or linked in the repository, not hand-entered.
 
 # References
 
