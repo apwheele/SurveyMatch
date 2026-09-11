@@ -1,0 +1,702 @@
+---
+title: "Identifying near-duplicate survey responses: full-distribution matching with false discovery control"
+author: "Andrew P. Wheeler"
+abstract: |
+  A common screen for fraudulent or duplicated survey responses flags any
+  pair of respondents whose answers agree above a fixed percentage, such as
+  85%. That threshold ignores how many response categories each question has
+  and how skewed their marginal distributions are, so it can flag most of a
+  survey by chance alone or miss deliberate duplication entirely, depending
+  on the instrument. I instead model the full distribution of pairwise match
+  counts across every respondent pair, fit an overdispersed null directly to
+  the data, and flag outliers with a false discovery rate correction chosen
+  for the strong dependence created by comparing every respondent against
+  every other respondent. Simulations show the approach avoids false alarms
+  from skewed marginals, recovers deliberately duplicated rows when only a
+  few fields are altered, and loses power as more fields are changed, which
+  is an inherent limit of exact-match comparison rather than a defect of the
+  correction. Applied to a real municipal survey, it flags a small number of
+  near-duplicate clusters, most explained by long runs of an identical
+  Likert response rather than fraud. Code, paper source, and a reproducible
+  environment are at https://github.com/apwheele/SurveyMatch.
+bibliography: references.bib
+link-citations: true
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    number-sections: true
+    header-includes:
+      - \usepackage{float}
+  gfm:
+    fig-dpi: 150
+    wrap: none
+    filters:
+      - filters/github-math.lua
+  docx:
+    fig-dpi: 150
+    number-sections: true
+    filters:
+      - filters/docx-clearpage.lua
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: surveymatch
+---
+
+```{python}
+#| label: setup
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from IPython.display import Markdown
+
+from surveymatch import (
+    connected_components,
+    expected_match_probs,
+    fdr_flag,
+    fit_beta_binomial_ml,
+    fit_normal_approx,
+    match_pvalues,
+    null_fit_sse,
+    pair_index,
+    pairwise_match_counts,
+    plot_match_fit,
+    simulate_correlated_responses,
+    simulate_responses,
+)
+from surveymatch.matching import poisson_binomial_null
+
+andy_theme = {
+    "axes.grid": True,
+    "grid.linestyle": "--",
+    "legend.framealpha": 1,
+    "legend.facecolor": "white",
+    "legend.shadow": True,
+    "legend.fontsize": 11,
+    "legend.title_fontsize": 12,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "axes.labelsize": 12,
+    "axes.titlesize": 13,
+    "axes.titlelocation": "left",
+    "figure.dpi": 150,
+}
+matplotlib.rcParams.update(andy_theme)
+
+# Marginal distributions used throughout: a fair coin, and three increasingly
+# skewed categorical distributions in which one response dominates. These
+# reappear in the simulated examples below.
+skew_components = [
+    np.array([0.9, 0.1]),
+    np.array([75.0, 4.0, 3.0, 2.0, 1.0]),
+    np.array([200.0, 20.0] + [3.0] * 8),
+]
+skew_components = [p / p.sum() for p in skew_components]
+```
+
+```{python}
+#| label: sim1-setup
+rng1 = np.random.default_rng([1])
+n1, v1 = 1000, 100
+sd1 = simulate_responses(n1, [[0.5, 0.5]] * v1, rng=rng1)
+co1 = pairwise_match_counts(sd1)
+bb1 = fit_beta_binomial_ml(co1, v1)
+pb1 = poisson_binomial_null(expected_match_probs(sd1))
+pvals1 = match_pvalues(co1, bb1)
+rej1, q1 = fdr_flag(pvals1, alpha=0.05, method="fdr_bh")
+```
+
+```{python}
+#| label: sim2-setup
+rng2 = np.random.default_rng([2])
+n2, v2 = 1000, 100
+question_probs2 = [
+    skew_components[rng2.integers(len(skew_components))] for _ in range(v2)
+]
+sd2 = simulate_responses(n2, question_probs2, rng=rng2)
+mu2 = expected_match_probs(sd2).sum()
+co2 = pairwise_match_counts(sd2)
+naive_threshold2 = 0.85 * v2
+naive_flagged2 = int((co2 >= naive_threshold2).sum())
+bb2 = fit_beta_binomial_ml(co2, v2)
+pvals2 = match_pvalues(co2, bb2)
+rej2, q2 = fdr_flag(pvals2, alpha=0.05, method="fdr_bh")
+```
+
+```{python}
+#| label: sim3-setup
+def inject_manipulated_duplicates(base, n_manip, k_manip, rng):
+    n_total, v = base.shape
+    subcopy = base[:n_manip].copy()
+    cols = rng.choice(v, size=k_manip, replace=False)
+    for r in range(n_manip):
+        for c in cols:
+            alt = np.setdiff1d(np.unique(base[:, c]), subcopy[r, c])
+            if alt.size:
+                subcopy[r, c] = rng.choice(alt)
+    out = base.copy()
+    out[-n_manip:] = subcopy
+    true_pairs = {tuple(sorted((i, n_total - n_manip + i))) for i in range(n_manip)}
+    return out, true_pairs
+
+
+def power_curve_rep(base, n_manip, k_manip, rng, alpha=0.05):
+    v = base.shape[1]
+    data, true_pairs = inject_manipulated_duplicates(base, n_manip, k_manip, rng)
+    counts = pairwise_match_counts(data)
+    null_dist = fit_beta_binomial_ml(counts, v)
+    pvals = match_pvalues(counts, null_dist)
+    rejected, _ = fdr_flag(pvals, alpha=alpha, method="fdr_bh")
+    flagged = {
+        tuple(sorted(p)) for p in pair_index(data.shape[0], rejected).tolist()
+    }
+    true_pos = len(true_pairs & flagged)
+    false_pos = len(flagged - true_pairs)
+    power = true_pos / n_manip
+    fdp = false_pos / len(flagged) if flagged else 0.0
+    return power, fdp
+
+
+rng3_base = np.random.default_rng([3, 0])
+n3, v3, n_manip3 = 300, 60, 30
+base3_probs = [
+    skew_components[rng3_base.integers(len(skew_components))] for _ in range(v3)
+]
+base3 = simulate_responses(n3, base3_probs, rng=rng3_base)
+
+k_grid3 = [1, 2, 3, 4, 5, 6, 8, 12, 20, 30]
+reps3 = 12
+power_rows = []
+for k in k_grid3:
+    powers, fdps = [], []
+    for rep in range(reps3):
+        rng_rep = np.random.default_rng([3, k, rep])
+        power, fdp = power_curve_rep(base3, n_manip3, k, rng_rep)
+        powers.append(power)
+        fdps.append(fdp)
+    power_rows.append({"k_manip": k, "power": np.mean(powers), "fdp": np.mean(fdps)})
+power_df = pd.DataFrame(power_rows)
+```
+
+```{python}
+#| label: fdr-calibration-setup
+n4, v4 = 250, 25
+rho_grid4 = [0.0, 0.3, 0.5]
+reps4 = 50
+calib_rows = []
+for rho in rho_grid4:
+    any_bh, n_bh, any_by, n_by = [], [], [], []
+    for rep in range(reps4):
+        rng_rep = np.random.default_rng([4, int(rho * 10), rep])
+        data = simulate_correlated_responses(
+            n4,
+            v4,
+            category_probs=[0.7, 0.2, 0.1],
+            tilt=[1.0, -0.3, -0.7],
+            rho=rho,
+            rng=rng_rep,
+        )
+        counts = pairwise_match_counts(data)
+        null_dist = fit_beta_binomial_ml(counts, v4)
+        pvals = match_pvalues(counts, null_dist)
+        rej_bh, _ = fdr_flag(pvals, alpha=0.05, method="fdr_bh")
+        rej_by, _ = fdr_flag(pvals, alpha=0.05, method="fdr_by")
+        any_bh.append(rej_bh.sum() > 0)
+        n_bh.append(rej_bh.sum())
+        any_by.append(rej_by.sum() > 0)
+        n_by.append(rej_by.sum())
+    calib_rows.append(
+        {
+            "rho": rho,
+            "bh_p_any": np.mean(any_bh),
+            "bh_mean_n": np.mean(n_bh),
+            "by_p_any": np.mean(any_by),
+            "by_mean_n": np.mean(n_by),
+        }
+    )
+calib_df = pd.DataFrame(calib_rows)
+```
+
+```{python}
+#| label: real-data-setup
+survey_raw = pd.read_csv("data/raleigh_survey_2018.csv")
+item_cols = list(survey_raw.columns)[4:68]
+survey_items = survey_raw[item_cols].fillna(9).astype(int).to_numpy().clip(1, 9)
+n5, v5 = survey_items.shape
+co5 = pairwise_match_counts(survey_items)
+bb5 = fit_beta_binomial_ml(co5, v5)
+nm5 = fit_normal_approx(co5)
+sse_bb5 = null_fit_sse(co5, bb5, v5)
+sse_nm5 = null_fit_sse(co5, nm5, v5)
+use_normal5 = sse_nm5 < sse_bb5
+chosen_null5 = nm5 if use_normal5 else bb5
+chosen_name5 = "normal" if use_normal5 else "beta-binomial"
+pvals5 = match_pvalues(co5, chosen_null5)
+rej5, q5 = fdr_flag(pvals5, alpha=0.05, method="fdr_by")
+flagged_pairs5 = pair_index(n5, rej5)
+components5 = connected_components(flagged_pairs5) if flagged_pairs5.size else []
+components5 = sorted(components5, key=len, reverse=True)
+
+
+def component_summary(rows):
+    sub = survey_items[rows]
+    unanimous_items = int(sum(len(np.unique(sub[:, c])) == 1 for c in range(v5)))
+    vals, cnts = np.unique(sub, return_counts=True)
+    modal_value = int(vals[np.argmax(cnts)])
+    modal_share = cnts.max() / sub.size
+    return unanimous_items, modal_value, modal_share
+
+
+component_rows = []
+for i, rows in enumerate(components5, start=1):
+    unanimous_items, modal_value, modal_share = component_summary(rows)
+    component_rows.append(
+        {
+            "component": i,
+            "n_respondents": len(rows),
+            "unanimous_items": unanimous_items,
+            "modal_value": modal_value,
+            "modal_share": modal_share,
+        }
+    )
+component_df = pd.DataFrame(component_rows)
+```
+
+# Introduction
+
+Survey researchers routinely need to flag suspicious duplicate responses: a
+paper respondent whose form was scanned twice, a web panelist replaying the
+same session, or a data-entry error that copied one row into another.
+@kuriakose2016 proposed a simple screen for this: compute the percentage of
+questions on which each pair of respondents gave an identical answer, and
+flag any pair above 85%. @pewresearch2016 and @day2023trustissues each point
+out the same problem with a fixed threshold: how often two independent,
+honest respondents agree by chance depends entirely on how the response
+categories are distributed, not on any threshold that generalizes across
+surveys. A battery of Likert items dominated by a few common answers can put
+the *large majority* of pairs above 85% agreement with no duplication at
+all, while a survey with many balanced, high-cardinality items will rarely
+reach that rate even for a genuine copy.
+
+This paper develops a full-distribution alternative. Rather than comparing
+each pair's match percentage to a fixed cutoff, I estimate the distribution
+of match counts across every pair of respondents in the survey and flag
+pairs that are outliers relative to that fitted distribution. Because every
+respondent takes part in $n-1$ comparisons, the resulting test statistics are
+highly dependent, so the multiple-comparisons correction needs to tolerate
+that dependence rather than assume independent tests. I also analyze the
+*entire* set of pairwise comparisons rather than each respondent's single
+largest match: reducing the problem to one extreme value per respondent
+needlessly complicates the analysis and can miss a respondent who was copied
+into several near-duplicates rather than just one.
+
+The method is a screening tool, not a fraud determination. A flagged pair is
+a candidate for follow-up review, and the paper's real-data example shows
+that most flagged clusters have an ordinary explanation -- a respondent who
+gave the same Likert response to nearly every item. The contribution is
+calibration: knowing which pairs are actually unusual, given the survey's own
+response distributions, rather than applying a rule of thumb that was
+calibrated on a different survey with different marginals.
+
+# Related work
+
+@kuriakose2016 is the starting point for this literature: a fixed
+percentage-match rule intended to flag fabricated survey data. @pewresearch2016
+critiqued the rule using Pew's own cross-national surveys, showing that many
+genuine respondent pairs exceed 85% agreement simply because several items
+have highly skewed response distributions. @day2023trustissues independently
+reached the same conclusion auditing a university's own survey data, and both
+critiques motivate the approach here: model the actual distribution of
+matches for the survey at hand instead of importing a threshold from another
+one.
+
+The method is also distinct from probabilistic record linkage
+[@fellegisunter1969; @enamorado2019], which weights field-by-field agreement
+by how informative each field is and is normally used to merge or de-duplicate
+records *across* separate files where true matches are rare and fields are
+a mix of continuous and categorical types. Here every respondent answers the
+same fixed categorical instrument, matches are compared within a single
+fielded survey, and the goal is to characterize the entire distribution of
+agreement rather than to score one-off candidate matches.
+
+Comparing response *patterns* also appears in test-fraud detection.
+@jacoblevitt2003 flag classrooms with unusual within-classroom agreement on
+blocks of answers, including agreement on wrong answers, which is a stronger
+signal than agreement alone but requires an answer key that a general opinion
+survey does not have. Fabricated data can also be detected by
+non-content forensic cues -- sorting artifacts, implausible formatting --
+as in @datacolada2023, and web-panel administrators can use paradata such as
+IP addresses and timestamps [@urbaninstitute2023] that are unavailable for
+a paper instrument like the one analyzed in this paper. Response-content
+matching is a complementary signal to all of these, useful precisely when
+paradata and answer keys are not available.
+
+The mean number of matches two independent respondents share on a single
+question is the sum of squared response-category proportions, i.e. the
+complement of the Gini--Simpson diversity index [@simpson1949]. Skewed
+marginals mechanically inflate this quantity, which is the mathematical root
+of the miscalibration problem described above. Finally, because comparing
+every respondent to every other respondent produces $\binom{n}{2}$ dependent
+test statistics, the relevant correction is a false discovery rate procedure
+that tolerates dependent tests [@benjaminihochberg1995; @benjaminiyekutieli2001],
+discussed further below.
+
+# Method
+
+## Setup
+
+Each of $n$ respondents answers $v$ categorical questions. Question $c$ has
+$K_c$ response categories with population proportions $p_{c1},\dots,p_{cK_c}$.
+For a pair of respondents $i \neq j$, define the match count
+
+$$
+M_{ij} = \sum_{c=1}^v \mathbb{1}\{X_{ic} = X_{jc}\},
+$$
+
+the number of questions on which they gave the identical answer. The method
+compares every one of the $\binom{n}{2}$ values of $M_{ij}$ to a fitted null
+distribution, rather than thresholding $M_{ij}/v$ against a fixed rate.
+
+## Expected matches under independence
+
+For two respondents drawn independently from the population, the probability
+they match on question $c$ depends only on that question's marginal
+distribution:
+
+$$
+\theta_c = \Pr(X_{ic}=X_{jc}) = \sum_{k=1}^{K_c} p_{ck}^2.
+$$
+
+Summing over questions gives the expected total match count,
+$\mu=\sum_c \theta_c = E[M_{ij}]$, exactly, with no assumption about
+correlation between questions *within* a respondent. That correlation instead
+determines $\mathrm{Var}(M_{ij})$: correlated answers make the per-question
+match indicators correlated for a given pair, inflating the variance of
+$M_{ij}$ above what independence would imply while leaving its mean
+unchanged. This is the mechanism behind @sec-sim2 below -- a handful of
+dominant response categories can push $\mu$ itself above a naive 85%
+threshold, with no need for any correlation or duplication at all.
+
+If the $v$ questions were independent given respondent identity, $M_{ij}$
+would follow a Poisson-binomial distribution with success probabilities
+$\theta_1,\dots,\theta_v$, computable exactly by a standard $O(v^2)$
+convolution recursion (implemented in `poisson_binomial_null`). Real survey
+items are rarely independent within a respondent -- response styles,
+acquiescence, and genuinely correlated attitudes all push several items in
+the same direction for the same person -- so this exact null understates
+$\mathrm{Var}(M_{ij})$ for real data. It remains useful as a check: when
+questions really are independent, as in the simulation of @sec-sim1, the
+Poisson-binomial and an empirically fit null should agree closely.
+
+## An empirically fit null
+
+Rather than assume independence, I fit an overdispersed distribution
+directly to the observed $\binom{n}{2}$ match counts. The primary choice is a
+beta-binomial, $M \sim \mathrm{BetaBinomial}(v,\alpha,\beta)$, fit by maximum
+likelihood. A closed-form method-of-moments estimator exists but is unstable
+near the boundary of valid $(\alpha,\beta)$; direct likelihood maximization is
+used throughout (`fit_beta_binomial_ml`). When match counts are
+*under*-dispersed relative to a binomial -- rare in practice, since it
+implies a survey with less pairwise agreement than independent chance would
+produce -- the method-of-moments algebra returns an invalid negative
+$\alpha$ or $\beta$, in which case a normal approximation matched to the
+sample mean and standard deviation is used instead
+(`fit_normal_approx`). The real-data application in this paper also uses the
+normal approximation, chosen automatically because it fits the observed
+histogram better than the beta-binomial's maximum-likelihood fit (measured by
+sum of squared error against the empirical histogram, `null_fit_sse`); see
+@sec-realdata.
+
+Given a fitted null $\hat F$, each pair receives a one-sided p-value,
+$p_{ij} = \Pr(M \ge m_{ij}) = 1-\hat F(m_{ij}-1)$, evaluated here as
+$1-\hat F(m_{ij})$ for a slightly conservative discrete convention.
+
+## Multiple comparisons under dependence
+
+Testing all $\binom{n}{2}$ pairs is a large multiple-comparisons problem, and
+the tests are not independent: every respondent appears in $n-1$ of them, so
+a respondent with an unusually common response profile inflates several
+$p_{ij}$ at once. The Benjamini--Hochberg procedure [@benjaminihochberg1995]
+controls the false discovery rate under independence or positive regression
+dependence, while the Benjamini--Yekutieli procedure [@benjaminiyekutieli2001]
+controls it under arbitrary dependence at the cost of being more
+conservative. @sec-calibration checks both empirically and finds that
+Benjamini--Hochberg is already somewhat liberal purely from
+respondent-sharing, even with independent questions, and that its excess
+false-flag rate grows sharply once questions are also correlated within a
+respondent. Benjamini--Yekutieli is better calibrated throughout that range,
+though its protection is not unconditional either -- at strong enough item
+correlation both procedures break down together. This motivates using
+Benjamini--Yekutieli as the safer default, and specifically for the real,
+correlated survey data in @sec-realdata.
+
+## Grouping flagged pairs
+
+Flagging pairs rather than respondents means one respondent's row can appear
+in several flagged pairs -- for instance if it was the source of a copy that
+was then further altered. I therefore treat the flagged pairs as edges of a
+graph and extract its connected components (`connected_components`), which
+groups respondents into clusters of mutual near-duplication rather than
+forcing an analyst to reassemble that structure from a flat pair list.
+
+# Simulated examples
+
+## Baseline calibration {#sec-sim1}
+
+As a first check, I replicate @kuriakose2016's original simulation:
+`{python} f"{n1:,}"` respondents answer `{python} f"{v1}"` independent,
+evenly split yes/no questions. @fig-sim1 compares the observed distribution
+of the `{python} f"{len(co1):,}"` pairwise match counts against the
+maximum-likelihood beta-binomial fit. Because the questions are genuinely
+independent here, the fitted beta-binomial mean
+(`{python} f"{bb1.mean():.1f}"`) and variance
+(`{python} f"{bb1.var():.2f}"`) closely track the exact Poisson-binomial
+null's mean (`{python} f"{pb1.mean():.1f}"`) and variance
+(`{python} f"{pb1.var():.2f}"`), confirming the empirical fit recovers the
+right answer when the textbook independence assumption actually holds. At a
+5% false discovery rate, Benjamini--Hochberg flags
+`{python} f"{int(rej1.sum())}"` pair(s) out of
+`{python} f"{len(co1):,}"` -- consistent with testing this many true nulls at
+that error rate, not evidence of any real duplication.
+
+```{python}
+#| label: fig-sim1
+#| fig-cap: "Sim 1: replication of the KR baseline (1,000 respondents, 100 independent Bernoulli(0.5) questions). Bars are the observed proportion of pairs at each match count; the line is the maximum-likelihood beta-binomial fit."
+plot_match_fit(co1, bb1, v1)
+plt.show()
+```
+
+## Skewed marginals: a red herring {#sec-sim2}
+
+A fixed match-rate threshold implicitly assumes every survey produces about
+the same chance agreement rate. @fig-sim2 shows a simple counter-example: the
+same number of respondents and questions as @sec-sim1, but each question is
+now drawn from one of three skewed distributions with a single dominant
+response category (as could arise from a battery of Likert items with strong
+ceiling effects). No duplication or manipulation is introduced anywhere.
+Summing the per-question collision probabilities gives an expected match
+rate of `{python} f"{mu2/v2*100:.0f}%"` of all `{python} f"{v2}"` questions --
+already close to the 85% rule-of-thumb threshold from chance alone. In the
+simulated sample, `{python} f"{naive_flagged2:,}"` of the
+`{python} f"{len(co2):,}"` pairs (`{python} f"{naive_flagged2/len(co2)*100:.1f}%"`)
+exceed the naive 85% match rate, which a fixed-threshold rule would flag as
+suspicious. The calibrated approach instead fits the null to this survey's
+own marginals and flags `{python} f"{int(rej2.sum())}"` pairs at a 5% false
+discovery rate, correctly finding nothing unusual.
+
+```{python}
+#| label: fig-sim2
+#| fig-cap: "Sim 2: skewed marginals with no duplication. Each of 100 questions is drawn from one of three distributions with a single dominant response category. The observed distribution (bars) and beta-binomial fit (line) both sit well above what an 85%-of-questions rule-of-thumb (dashed) would treat as normal."
+ax = plot_match_fit(co2, bb2, v2)
+ax.axvline(naive_threshold2, color="firebrick", linestyle=":", label="85% threshold")
+ax.legend(frameon=False)
+plt.show()
+```
+
+## Detecting manipulated duplicates {#sec-sim3}
+
+The scenario the method is actually meant to catch is deliberate but lazy
+duplication: copying an existing response and changing a handful of fields.
+Starting from a skewed-marginal population like @sec-sim2 (`{python} f"{n3}"`
+respondents, `{python} f"{v3}"` questions), I copy `{python} f"{n_manip3}"`
+rows, randomly alter $k$ of the $v_3$ fields in each copy, and check whether
+the true copy-original pairs are recovered. @fig-sim3-power shows detection
+power -- the fraction of the `{python} f"{n_manip3}"` true duplicate pairs
+correctly flagged -- and the false discovery proportion among flagged pairs,
+averaged over `{python} f"{reps3}"` replications at each value of $k$. Power
+is high when only a few fields are altered and falls as $k$ grows, which is
+an unavoidable property of exact-field matching rather than a weakness of the
+correction: once enough fields differ, a manipulated copy is no longer
+statistically distinguishable from an independent respondent who happens to
+share the same skewed marginals. The false discovery proportion stays
+controlled near the nominal 5% level throughout, so the method does not
+compensate for lost power by flagging more false positives.
+
+```{python}
+#| label: fig-sim3-power
+#| fig-cap: "Sim 3: detection power and false discovery proportion for a 30-row manipulated duplicate batch, as a function of how many of 60 fields were altered per copy. Each point averages 12 replications."
+fig, ax1 = plt.subplots(figsize=(7, 4.2))
+ax1.plot(power_df["k_manip"], power_df["power"], marker="o", color="black", label="Power")
+ax1.plot(power_df["k_manip"], power_df["fdp"], marker="s", color="firebrick", label="False discovery proportion")
+ax1.axhline(0.05, color="grey", linestyle=":", linewidth=1)
+ax1.set_xlabel("Number of fields altered per manipulated copy ($k$)")
+ax1.set_ylabel("Proportion")
+ax1.set_ylim(-0.02, 1.02)
+ax1.legend(frameon=False)
+plt.show()
+```
+
+## Choosing an FDR procedure under correlated items {#sec-calibration}
+
+@sec-sim1 and @sec-sim2 use independent questions, but that alone does not
+make the $\binom{n}{2}$ pairwise tests independent of each other: every
+respondent contributes to $n-1$ of them, which is enough dependence by
+itself to matter. @tbl-bhby simulates `{python} f"{n4}"` respondents on
+`{python} f"{v4}"` questions whose answers share a common respondent-level
+trait of increasing strength $\rho$ (so $\rho=0$ isolates pure
+respondent-sharing dependence, and larger $\rho$ adds real within-respondent
+item correlation on top of it), with the beta-binomial null re-fit to each
+simulated sample and no true duplicates present. Because no true duplicates
+exist, any rejection is a false one, so the proportion of replications with
+at least one rejection is directly comparable to the nominal 5% level. Even
+at $\rho=0$, Benjamini--Hochberg's false-rejection rate
+(`{python} f"{calib_df.loc[calib_df.rho == 0.0, 'bh_p_any'].iloc[0]*100:.0f}%"`)
+sits well above 5% from respondent-sharing alone, while Benjamini--Yekutieli
+stays near or below it
+(`{python} f"{calib_df.loc[calib_df.rho == 0.0, 'by_p_any'].iloc[0]*100:.0f}%"`).
+As $\rho$ increases, Benjamini--Hochberg's excess grows sharply while
+Benjamini--Yekutieli remains better calibrated over most of this range --
+though at the highest correlation shown, both procedures flag nearly every
+replication, which is a reminder that no multiple-comparisons correction can
+fully compensate for a badly misspecified single overall null once
+respondents cluster into strongly self-similar subgroups. This is why
+@sec-realdata below uses Benjamini--Yekutieli for the real, correlated
+survey data.
+
+```{python}
+#| label: tbl-bhby
+#| tbl-cap: "Empirical false-rejection rate under the true null (no duplicates) as within-respondent item correlation increases. 'P(any rejection)' is the share of 50 replications with at least one flagged pair; a well-calibrated procedure at the 5% level should keep this at or below 0.05."
+display_df = calib_df.rename(
+    columns={
+        "rho": "Correlation (rho)",
+        "bh_p_any": "BH: P(any rejection)",
+        "bh_mean_n": "BH: mean # flagged",
+        "by_p_any": "BY: P(any rejection)",
+        "by_mean_n": "BY: mean # flagged",
+    }
+)
+Markdown(display_df.to_markdown(index=False, floatfmt=(".2f", ".3f", ".2f", ".3f", ".2f")))
+```
+
+# Application: the 2018 Raleigh community survey {#sec-realdata}
+
+I apply the method to a public block of `{python} f"{v5}"` Likert-style items
+from the City of Raleigh's 2018 community survey
+(`{python} f"{n5:,}"` respondents; see the `data/` folder for the source file
+and codebook). Response categories are collapsed to the integers 1--9,
+following the source instrument's coding, with missing values coded 9. This
+is real fielded data, not a simulation, so I do not know the ground truth of
+which pairs, if any, are genuine duplicates.
+
+The beta-binomial maximum-likelihood fit visibly underestimates the left
+skew of the observed match-count distribution for this survey; the automatic
+goodness-of-fit check confirms the normal approximation is the better fit
+(sum of squared error `{python} f"{sse_nm5:.5f}"` vs.
+`{python} f"{sse_bb5:.5f}"`), so the normal null is used here, exactly as the
+method's fallback rule anticipates. @fig-real-fit shows both fits for
+comparison. At a 5% false discovery rate with the Benjamini--Yekutieli
+correction, `{python} f"{int(rej5.sum())}"` of the
+`{python} f"{len(co5):,}"` pairs are flagged, forming
+`{python} f"{len(components5)}"` connected components of mutually
+near-duplicate respondents.
+
+```{python}
+#| label: fig-real-fit
+#| fig-cap: "Observed pairwise match-count distribution for the Raleigh survey (64 items) against maximum-likelihood beta-binomial and normal-approximation fits. The normal fit is used for the flagging analysis because it has lower sum of squared error against the histogram."
+fig, axes = plt.subplots(1, 2, figsize=(9, 4), sharey=True)
+plot_match_fit(co5, bb5, v5, ax=axes[0], label="Beta-binomial")
+axes[0].set_title("Beta-binomial fit")
+plot_match_fit(co5, nm5, v5, ax=axes[1], label="Normal", color="firebrick")
+axes[1].set_title("Normal fit")
+axes[1].set_ylabel("")
+plt.tight_layout()
+plt.show()
+```
+
+@tbl-components summarizes the flagged clusters. For each, "unanimous items"
+counts how many of the 64 questions every respondent in the cluster answered
+identically, and "modal share" is the fraction of all cell values in the
+cluster equal to its single most common value. Clusters with both figures
+high are consistent with a respondent giving one repeated response to most
+of the survey -- a long "run" of, say, all 5's -- rather than a copied and
+lightly edited record. Clusters with lower values on both measures have more
+varied response patterns and are comparatively harder to explain by a single
+repeated response.
+
+```{python}
+#| label: tbl-components
+#| tbl-cap: "Connected components of flagged near-duplicate pairs in the Raleigh survey. Unanimous items counts questions where every respondent in the cluster gave the identical answer; modal share is the fraction of all cell values equal to the cluster's single most common value."
+display_components = component_df.rename(
+    columns={
+        "component": "Component",
+        "n_respondents": "Respondents",
+        "unanimous_items": "Unanimous items (of 64)",
+        "modal_value": "Modal value",
+        "modal_share": "Modal share",
+    }
+)
+Markdown(display_components.to_markdown(index=False, floatfmt=(".0f", ".0f", ".0f", ".0f", ".2f")))
+```
+
+Most components have a high count of unanimous items and a high modal share,
+consistent with respondents who gave the same Likert response -- most often
+a 4, 5, or the missing-data code 9 -- across nearly the entire instrument;
+duplicate flags here most plausibly reflect straight-lining rather than
+copied records. The remaining components have more varied responses across
+their unanimous items and a lower modal share, and are correspondingly
+harder to write off; they are the pairs an analyst reviewing this survey
+would want to look at individually.
+
+# Discussion
+
+The central point is that "unusual" is relative to a survey's own response
+distributions, not a fixed percentage borrowed from a different instrument.
+Fitting the null directly avoids two opposite failure modes: treating
+ordinary skewed-marginal agreement as fraud, and letting a genuinely
+suspicious pattern slide because it falls under an arbitrary cutoff. Testing
+every pairwise comparison, rather than only the maximum match per
+respondent, also lets the method surface a respondent duplicated into
+several near-copies -- a pattern a single-comparison approach would only
+partially recover.
+
+The simulations also show a real limit of the method, not just its
+strengths: recovery power depends almost entirely on how many fields a
+manipulator bothered to change, and beyond a modest number of altered fields
+a deliberately manipulated row is statistically indistinguishable from an
+independent respondent. This screen is therefore best understood as catching
+lazy duplication and unintentional retakes, not a determined adversary who is
+willing to edit most of the record. That is a reasonable division of labor:
+someone who can systematically and plausibly fabricate an entire response
+profile is better caught by other means, such as paradata or field
+experience, not by post-hoc statistical screening of the response content
+alone [@urbaninstitute2023].
+
+The false discovery rate correction matters as much as the null model.
+@sec-calibration shows that even with a correctly fit marginal null,
+treating the $\binom{n}{2}$ pairwise tests as independent understates the
+false-flag rate, because every respondent contributes to $n-1$ tests at
+once; that gap widens sharply once survey items are also realistically
+correlated within a respondent. Benjamini--Yekutieli's guarantee under
+arbitrary dependence is a
+conservative fix; a useful extension would be a dependence-aware resampling
+or permutation-based procedure calibrated to a specific survey's actual item
+correlation structure, which could recover some of the power that
+Benjamini--Yekutieli gives up.
+
+Finally, this is a screening tool. A flagged cluster in @sec-realdata is a
+candidate for an analyst's review, not proof of a bad-faith response, and the
+majority of the flagged clusters in that example are well explained by a
+respondent repeating one answer through most of a long instrument. The value
+of the method is in directing that review efficiently and consistently,
+rather than by a rule of thumb that changes meaning from one survey to the
+next.
+
+# AI use disclosure
+
+The `surveymatch` Python package, its test suite, the simulations in this
+paper, and the paper text were produced with Claude Code (Anthropic,
+Sonnet 5) under my direction and review. I designed the original method and
+wrote the reference implementation this package extends and cleans up
+(`comp_funcs.py` and the accompanying notebook, linked from the repository),
+selected the real survey data and its preprocessing, specified every
+simulation design and parameter choice described above, and reviewed the
+generated code, statistical results, and text for correctness before
+publication. All numeric results and figures in this paper are computed live
+by the code shown or linked in the repository, not hand-entered.
+
+# References
+
+\small

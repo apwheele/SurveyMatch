@@ -1,0 +1,29 @@
+[project]
+name = "surveymatch"
+version = "0.1.0"
+description = "Detecting near-duplicate survey responses via pairwise match-count distributions and FDR correction"
+readme = "README.md"
+authors = [
+    { name = "apwheele", email = "apwheele@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "networkx>=3.6.1",
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "scipy>=1.18.1",
+    "statsmodels>=0.15.0",
+    "tabulate>=0.10.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.9,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "jupyter>=1.1.1",
+    "pytest>=9.1.1",
+]
